@@ -83,17 +83,6 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
         topk_weights.masked_fill_(topk_idx < 0, 0)
 
     if not args.skip_check:
-        if args.allow_multiple_reduction:
-            # Should be the same as the trigger condition of DeepEP's hybrid combine, which performs intra-scaleup reduction first
-            if args.allow_hybrid_mode and num_scaleout_ranks > 1:
-                reduced_combine_recipe = (True, True)
-                combine_recipe = (True, True)
-            else:
-                reduced_combine_recipe = (True, False)
-                combine_recipe = (True, False)
-        else:
-            reduced_combine_recipe = (False, False)
-            combine_recipe = (True, False)
         ref_y = generate_pre_combine_data(
             dist.get_rank() * num_max_tokens_per_rank + torch.arange(num_tokens, device='cuda'),
             num_max_tokens_per_rank, num_topk, hidden)
@@ -130,6 +119,17 @@ def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
                 ref_dispatch(x, topk_idx, topk_weights, num_max_tokens_per_rank, num_experts)
             ref_recv_x_bf16 = get_recv_x_bf16(ref_recv_x)
 
+            if args.allow_multiple_reduction:
+                # Should be the same as the trigger condition of DeepEP's hybrid combine, which performs intra-scaleup reduction first
+                if args.allow_hybrid_mode and num_scaleout_ranks > 1:
+                    reduced_combine_recipe = (True, True)
+                    combine_recipe = (True, True)
+                else:
+                    reduced_combine_recipe = (True, False)
+                    combine_recipe = (True, False)
+            else:
+                reduced_combine_recipe = (False, False)
+                combine_recipe = (True, False)
             ref_reduced_combined_y = ref_combine(
                 ref_y, topk_idx,
                 num_scaleout_ranks, num_scaleup_ranks, num_experts,
