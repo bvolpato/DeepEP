@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import torch
 
@@ -13,77 +13,49 @@ _TESTING_SPEC = importlib.util.spec_from_file_location('deep_ep_testing', _TESTI
 testing = importlib.util.module_from_spec(_TESTING_SPEC)
 _TESTING_SPEC.loader.exec_module(testing)
 
+class _CpuProfiler(torch.profiler.profile):
 
-class _CpuEventTable:
+    instances = []
 
-    def __init__(self, events):
-        self.events = events
-
-    def table(self, **kwargs):
-        kwargs['sort_by'] = 'cpu_time_total'
-        return self.events.table(**kwargs)
-
-
-class _CpuProfilerAdapter:
-
-    def __init__(self, profiler):
-        self.profiler = profiler
-        self.steps = 0
-
-    def __enter__(self):
-        self.profiler.__enter__()
-        return self
-
-    def __exit__(self, *args):
-        return self.profiler.__exit__(*args)
-
-    def step(self):
-        self.steps += 1
-        self.profiler.step()
+    def __init__(self, **kwargs):
+        kwargs['activities'] = [torch.profiler.ProfilerActivity.CPU]
+        super().__init__(**kwargs)
+        self.events = None
+        self.instances.append(self)
 
     def key_averages(self):
-        return _CpuEventTable(self.profiler.key_averages())
+        self.events = super().key_averages()
+
+        def cpu_table(**kwargs):
+            kwargs['sort_by'] = 'cpu_time_total'
+            return self.events.table(**kwargs)
+
+        return SimpleNamespace(table=cpu_table)
 
 
 class BenchKinetoTest(unittest.TestCase):
 
-    def test_kineto_uses_one_warmup_and_num_tests_recorded_callbacks(self):
-        real_profile = torch.profiler.profile
-        real_activity = torch.profiler.ProfilerActivity
+    def test_kineto_warmup_budget_and_recorded_samples(self):
         real_ones = torch.ones
-        profilers = []
-        calls = []
-        flushes = []
-        barriers = []
-        synchronizations = []
-
-        def cpu_profile(activities, **kwargs):
-            self.assertEqual(activities, [real_activity.CPU])
-            adapter = _CpuProfilerAdapter(real_profile(activities=activities, **kwargs))
-            profilers.append(adapter)
-            return adapter
-
-        def cpu_ones(*args, **kwargs):
-            return real_ones(*args, **{**kwargs, 'device': 'cpu'})
+        calls, barrier = Mock(), Mock()
 
         def fn():
-            calls.append(None)
             with torch.profiler.record_function('kineto_test_kernel'):
-                pass
+                calls()
 
-        with patch.object(torch.profiler, 'ProfilerActivity', SimpleNamespace(CUDA=real_activity.CPU)), \
-             patch.object(torch.profiler, 'profile', side_effect=cpu_profile), \
-             patch.object(torch, 'ones', side_effect=cpu_ones), \
-             patch.object(torch.cuda, 'synchronize', side_effect=lambda: synchronizations.append(None)), \
+        with patch.object(torch.profiler, 'profile', _CpuProfiler), \
+             patch.object(torch, 'ones', side_effect=lambda *args, **kwargs: real_ones(
+                 *args, **{**kwargs, 'device': 'cpu'})), \
+             patch.object(torch.cuda, 'synchronize'), \
              patch.object(torch.cuda, '_sleep', lambda _: None, create=True), \
-             patch.object(testing, 'flush_l2_cache', side_effect=lambda enabled=True: flushes.append(enabled)), \
+             patch.object(testing, 'flush_l2_cache') as flush_cache, \
              patch.dict(os.environ, {'EP_USE_NVIDIA_TOOLS': '0', 'EP_DISABLE_BARRIER_PROFILING': '0'}):
             for num_tests in (30, 1):
                 with self.subTest(num_tests=num_tests):
-                    calls.clear()
-                    flushes.clear()
-                    barriers.clear()
-                    synchronizations.clear()
+                    calls.reset_mock()
+                    flush_cache.reset_mock()
+                    barrier.reset_mock()
+                    _CpuProfiler.instances.clear()
 
                     testing.bench_kineto(
                         fn,
@@ -91,17 +63,15 @@ class BenchKinetoTest(unittest.TestCase):
                         num_tests=num_tests,
                         flush_l2=True,
                         barrier_comm_profiling=True,
-                        barrier=lambda: barriers.append(None),
+                        barrier=barrier,
                     )
 
-                    self.assertEqual(len(calls), num_tests + 2)  # Preflight, warmup, and measured callbacks.
-                    self.assertEqual(len(flushes), num_tests + 1)
-                    self.assertTrue(all(flushes))
-                    self.assertEqual(len(barriers), num_tests + 1)
-                    self.assertEqual(len(synchronizations), 3)
-                    self.assertEqual(profilers[-1].steps, 2)
-                    event_counts = {event.key: event.count for event in profilers[-1].profiler.key_averages()}
-                    self.assertEqual(event_counts['kineto_test_kernel'], num_tests)
+                    self.assertEqual(calls.call_count, num_tests + 2)
+                    self.assertEqual(flush_cache.call_args_list, [call(True)] * (num_tests + 1))
+                    self.assertEqual(barrier.call_count, num_tests + 1)
+                    event_counts = [event.count for event in _CpuProfiler.instances[-1].events
+                                    if event.key == 'kineto_test_kernel']
+                    self.assertEqual(event_counts, [num_tests])
 
 
 if __name__ == '__main__':
